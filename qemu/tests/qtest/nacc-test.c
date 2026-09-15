@@ -3,9 +3,7 @@
  *
  * 단계 1: PCI 식별, BAR0, 레지스터 파일
  * 단계 2: 상태 머신 (T1/T2/T3/T5/T8/T9/T10) + "전이표에 없는 조합"
- * 단계 3: 커맨드 링 (T4/T6/T7/T11/T12), NOP, writeback
- *
- * 미검증: MEMCPY 데이터 이동, BAD_LENGTH / BAD_ALIGN
+ * 단계 3: 커맨드 링 (T4/T6/T7/T11/T12), NOP, MEMCPY, writeback
  *
  * 검증 환경 전제:
  *   -machine virt,highmem-ecam=off
@@ -15,10 +13,16 @@
  *       기본 virtio-net 이 슬롯 1 을 차지한다.
  *   BAR 설정 시 BME(0x04) 필수 — 없으면 pci_dma_read 가 실패한다.
  *
+ * step_one_desc() 는 정확히 EXEC_DELAY_MS 만큼만 전진시켜야 한다.
+ * +1 을 더하면 매 스텝 1ms 씩 남아 누적되고, 어느 스텝에서 두 개가
+ * 한꺼번에 처리된다. 콜백이 데드라인 시점의 클럭을 기준으로 다음
+ * 타이머를 걸기 때문이다.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest-single.h"
 
 /* ------------------------------------------------------------------
@@ -101,6 +105,10 @@
 #define OP_NOP              0x00
 #define OP_MEMCPY           0x01
 
+/* §6.1 NACC-REQ-035 — MEMCPY 제약 */
+#define MAX_XFER            0x100000u   /* 1 MiB */
+#define XFER_CHUNK          4096        /* 디바이스의 바운스 버퍼 크기 */
+
 /* 유효한 링 설정 — 32바이트 정렬, 2의 거듭제곱 */
 #define RING_ADDR           0x40000000ULL
 #define RING_SZ             8
@@ -108,6 +116,9 @@
 /* MEMCPY 버퍼용 영역. 링과 겹치지 않게 */
 #define SRC_ADDR            (RING_ADDR + 0x10000)
 #define DST_ADDR            (RING_ADDR + 0x20000)
+
+/* RAM 밖 주소. DMA_FAULT 유발용 */
+#define BAD_ADDR            0xFFFF000000000000ULL
 
 /*
  * 디바이스 구현의 지연 상수와 맞춰야 한다.
@@ -121,6 +132,9 @@
 
 /* writeback 이 실제로 일어났는지 보려고 미리 심어두는 값 */
 #define STATUS_POISON       0xA5A5A5A5u
+
+/* 목적지 버퍼를 미리 채워 두는 값. 침범을 검출한다 */
+#define DST_POISON          0xEE
 
 /* §5.1 정의되지 않은 오프셋 (NACC-REQ-021) */
 static const uint32_t undefined_offsets[] = {
@@ -201,10 +215,10 @@ static void nacc_clock_step_ms(int64_t ms)
     qtest_clock_step(global_qtest, ms * MS_IN_NS);
 }
 
-/* 디스크립터 하나가 처리될 만큼만 전진 */
+/* 디스크립터 하나가 처리될 만큼만 전진. 파일 상단 주석 참조 */
 static void step_one_desc(void)
 {
-    nacc_clock_step_ms(EXEC_DELAY_MS + 1);
+    nacc_clock_step_ms(EXEC_DELAY_MS);
 }
 
 static uint64_t ring_slot_addr(uint32_t slot)
@@ -243,6 +257,76 @@ static void ring_fill_nop(uint32_t count)
     for (uint32_t i = 0; i < count; i++) {
         ring_put(i, OP_NOP, 0, 0, 0);
     }
+}
+
+/* ---- MEMCPY 용 메모리 헬퍼 ---------------------------------------- */
+
+/* addr 부터 len 바이트를 (seed + i) 패턴으로 채운다 */
+static void mem_fill_pattern(uint64_t addr, uint32_t len, uint8_t seed)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+
+    for (uint32_t i = 0; i < len; i++) {
+        buf[i] = (uint8_t)(seed + i);
+    }
+    qtest_memwrite(global_qtest, addr, buf, len);
+}
+
+/* addr 부터 len 바이트가 (seed + i) 패턴인지 확인한다 */
+static void mem_check_pattern(uint64_t addr, uint32_t len, uint8_t seed)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+
+    qtest_memread(global_qtest, addr, buf, len);
+    for (uint32_t i = 0; i < len; i++) {
+        if (buf[i] != (uint8_t)(seed + i)) {
+            g_error("pattern mismatch at +0x%x: got 0x%02x want 0x%02x",
+                    i, buf[i], (uint8_t)(seed + i));
+        }
+    }
+}
+
+/* addr 부터 len 바이트를 같은 값으로 채운다 */
+static void mem_fill_byte(uint64_t addr, uint32_t len, uint8_t v)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+
+    memset(buf, v, len);
+    qtest_memwrite(global_qtest, addr, buf, len);
+}
+
+/* addr 부터 len 바이트가 전부 v 인지 확인한다 */
+static void mem_check_byte(uint64_t addr, uint32_t len, uint8_t v)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+
+    qtest_memread(global_qtest, addr, buf, len);
+    for (uint32_t i = 0; i < len; i++) {
+        if (buf[i] != v) {
+            g_error("unexpected write at +0x%x: got 0x%02x want 0x%02x",
+                    i, buf[i], v);
+        }
+    }
+}
+
+/*
+ * MEMCPY 하나를 제출하고 완료될 때까지 돌린다.
+ * 반환값은 최종 상태 (ST_READY 또는 ST_ERROR).
+ */
+static uint32_t run_one_memcpy(uint64_t src, uint64_t dst, uint32_t len,
+                               uint32_t max_steps)
+{
+    ring_put(0, OP_MEMCPY, src, dst, len);
+    nacc_to_ready();
+    nacc_writel(R_RING_PROD, 1);
+
+    for (uint32_t i = 0; i < max_steps; i++) {
+        if (nacc_state() != ST_BUSY) {
+            break;
+        }
+        step_one_desc();
+    }
+    return nacc_state();
 }
 
 /* ==================================================================
@@ -783,13 +867,12 @@ static void test_id_stable_across_states(void)
 }
 
 /* ==================================================================
- * 단계 3 — 커맨드 링
+ * 단계 3 — 커맨드 링 (NOP)
  * ================================================================== */
 
 /*
  * RING_ADDR 이 실제 RAM 인지 먼저 확인한다.
  * 여기가 실패하면 이후 링 테스트가 전부 DMA_FAULT 로 무너진다.
- * 원인 찾느라 헤매지 않도록 별도 테스트로 둔다.
  */
 static void test_ram_sanity(void)
 {
@@ -997,7 +1080,10 @@ static void test_t12_bad_prod_during_busy(void)
 
 /*
  * T7 — 정의되지 않은 opcode.
+ *
  * NACC-REQ-078: RING_CONS 가 실패한 디스크립터를 가리킨 채 고정된다.
+ * NACC-REQ-050: 실패한 슬롯의 status 에 오류 코드가 기록된다.
+ *               BAD_OPCODE 분기도 nacc_fail_descriptor() 를 써야 한다.
  */
 static void test_t7_bad_opcode(void)
 {
@@ -1018,6 +1104,8 @@ static void test_t7_bad_opcode(void)
     /* 실패한 슬롯을 가리킨 채 고정 — 다음 슬롯이 아니다 */
     g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
     g_assert_cmphex(nacc_readl(R_IRQ_STATUS) & IRQ_CMD_ERR, ==, IRQ_CMD_ERR);
+    /* NACC-REQ-050 */
+    g_assert_cmphex(ring_status(2), ==, ERR_BAD_OPCODE);
 
     /* 이후 슬롯은 건드리지 않는다 */
     g_assert_cmphex(ring_status(3), ==, STATUS_POISON);
@@ -1112,19 +1200,13 @@ static void test_restart_after_abort(void)
  *
  * §3.5 유효성 판정은 정렬과 0 여부만 보므로 READY 까지는 간다.
  * doorbell 을 치는 순간 페치가 실패해야 한다 (§6.6 1번).
- *
- * 주의: QEMU 가 MEMTX_OK 를 반환하고 0 을 읽어오면 opcode 가 0(NOP) 으로
- * 해석되어 성공해 버린다. 그 경우 이 테스트는 실패하며, 별도 주입 장치가
- * 필요하다는 뜻이다. qemu/README.md 에 기록할 것.
  */
 static void test_dma_fault_out_of_ram(void)
 {
-    const uint64_t bad_base = 0xFFFF000000000000ULL;    /* 32B 정렬, 0 아님 */
-
     nacc_start();
 
-    nacc_writel(R_RING_BASE_LO, (uint32_t)bad_base);
-    nacc_writel(R_RING_BASE_HI, (uint32_t)(bad_base >> 32));
+    nacc_writel(R_RING_BASE_LO, (uint32_t)BAD_ADDR);
+    nacc_writel(R_RING_BASE_HI, (uint32_t)(BAD_ADDR >> 32));
     nacc_writel(R_RING_SIZE, RING_SZ);
     nacc_writel(R_CTRL, CTRL_ENABLE);
     g_assert_cmpuint(nacc_state(), ==, ST_READY);       /* 주소는 검증 못 함 */
@@ -1134,6 +1216,267 @@ static void test_dma_fault_out_of_ram(void)
 
     g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_DMA_FAULT);
+
+    qtest_end();
+}
+
+/* ==================================================================
+ * 단계 3 — MEMCPY
+ * ================================================================== */
+
+/* 기본 복사. 64바이트 */
+static void test_memcpy_basic(void)
+{
+    const uint32_t len = 64;
+
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, len, 0x10);
+    mem_fill_byte(DST_ADDR, len, DST_POISON);
+
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR, DST_ADDR, len, 8),
+                     ==, ST_READY);
+
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS), ==, IRQ_CMD_DONE);
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+
+    mem_check_pattern(DST_ADDR, len, 0x10);
+
+    qtest_end();
+}
+
+/*
+ * 청크 경계를 넘는 전송.
+ * 디바이스는 XFER_CHUNK(4096) 단위 바운스 버퍼로 나눠 옮긴다.
+ * 경계 계산이 틀리면 여기서 걸린다.
+ */
+static void test_memcpy_multi_chunk(void)
+{
+    const uint32_t len = XFER_CHUNK * 2;    /* 8 KiB */
+
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, len, 0x37);
+    mem_fill_byte(DST_ADDR, len, DST_POISON);
+
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR, DST_ADDR, len, 8),
+                     ==, ST_READY);
+
+    mem_check_pattern(DST_ADDR, len, 0x37);
+
+    qtest_end();
+}
+
+/* 청크 경계에 딱 걸치지 않는 길이 */
+static void test_memcpy_odd_chunk(void)
+{
+    const uint32_t len = XFER_CHUNK + 4;
+
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, len, 0x5A);
+    mem_fill_byte(DST_ADDR, len, DST_POISON);
+
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR, DST_ADDR, len, 8),
+                     ==, ST_READY);
+
+    mem_check_pattern(DST_ADDR, len, 0x5A);
+
+    qtest_end();
+}
+
+/*
+ * 목적지 무결성 — 요청한 길이 뒤쪽을 침범하지 않는지.
+ *
+ * 길이 계산이 틀리면 인접 메모리를 덮어쓴다.
+ * 실제 드라이버에서는 커널 메모리 손상이 되는 종류다.
+ */
+static void test_memcpy_dest_integrity(void)
+{
+    const uint32_t len   = 64;
+    const uint32_t guard = 64;
+
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, len, 0x20);
+    mem_fill_byte(DST_ADDR, len + guard, DST_POISON);
+
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR, DST_ADDR, len, 8),
+                     ==, ST_READY);
+
+    mem_check_pattern(DST_ADDR, len, 0x20);
+    /* 뒤쪽 guard 바이트는 그대로여야 한다 */
+    mem_check_byte(DST_ADDR + len, guard, DST_POISON);
+
+    qtest_end();
+}
+
+/*
+ * NACC-REQ-035 — length 제약.
+ * 4의 배수, 4 <= len <= 1 MiB.
+ */
+static void test_memcpy_bad_length(void)
+{
+    const struct {
+        uint32_t len;
+        const char *why;
+    } cases[] = {
+        { 0,             "0" },
+        { 1,             "4의 배수 아님" },
+        { 3,             "4의 배수 아님" },
+        { 5,             "4의 배수 아님" },
+        { MAX_XFER + 4,  "상한 초과" },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        nacc_start();
+
+        mem_fill_byte(DST_ADDR, 64, DST_POISON);
+
+        g_assert_cmpuint(run_one_memcpy(SRC_ADDR, DST_ADDR, cases[i].len, 8),
+                         ==, ST_ERROR);
+        g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_LENGTH);
+        /* NACC-REQ-050 */
+        g_assert_cmphex(ring_status(0), ==, ERR_BAD_LENGTH);
+        /* NACC-REQ-067: 검증 오류는 전송을 시작하지 않는다 */
+        mem_check_byte(DST_ADDR, 64, DST_POISON);
+        /* NACC-REQ-078: cons 는 실패한 슬롯을 가리킨다 */
+        g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);
+
+        qtest_end();
+    }
+}
+
+/* MAX_XFER 는 유효해야 한다 — 상한 경계 */
+static void test_memcpy_max_length_valid(void)
+{
+    nacc_start();
+
+    /* 실제로 1 MiB 를 옮기면 느리므로 상태만 확인한다.
+     * SRC/DST 가 1 MiB 씩 떨어져 있지 않으므로 겹칠 수 있으나
+     * (§6.5 NACC-REQ-046 미정의), 여기서 보는 것은 길이 검증뿐이다. */
+    ring_put(0, OP_MEMCPY, SRC_ADDR, SRC_ADDR + MAX_XFER, MAX_XFER);
+    nacc_to_ready();
+    nacc_writel(R_RING_PROD, 1);
+
+    for (int i = 0; i < 8 && nacc_state() == ST_BUSY; i++) {
+        step_one_desc();
+    }
+
+    g_assert_cmpuint(nacc_state(), !=, ST_ERROR);
+
+    qtest_end();
+}
+
+/* NACC-REQ-035 — src / dst 4바이트 정렬 */
+static void test_memcpy_bad_align(void)
+{
+    const struct {
+        uint64_t src;
+        uint64_t dst;
+        const char *why;
+    } cases[] = {
+        { SRC_ADDR | 1, DST_ADDR,     "src 미정렬" },
+        { SRC_ADDR | 2, DST_ADDR,     "src 미정렬" },
+        { SRC_ADDR,     DST_ADDR | 1, "dst 미정렬" },
+        { SRC_ADDR,     DST_ADDR | 3, "dst 미정렬" },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        nacc_start();
+
+        mem_fill_byte(DST_ADDR, 64, DST_POISON);
+
+        g_assert_cmpuint(run_one_memcpy(cases[i].src, cases[i].dst, 64, 8),
+                         ==, ST_ERROR);
+        g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_ALIGN);
+        g_assert_cmphex(ring_status(0), ==, ERR_BAD_ALIGN);
+        /* 전송이 시작되지 않았다 */
+        mem_check_byte(DST_ADDR, 64, DST_POISON);
+
+        qtest_end();
+    }
+}
+
+/*
+ * §6.6 NACC-REQ-055 — 검증 순서.
+ * length 와 정렬이 동시에 틀리면 BAD_LENGTH 가 먼저 나야 한다.
+ */
+static void test_memcpy_length_checked_first(void)
+{
+    nacc_start();
+
+    /* 길이도 3, src 도 미정렬 */
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR | 1, DST_ADDR, 3, 8),
+                     ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_LENGTH);
+
+    qtest_end();
+}
+
+/* 소스가 RAM 밖 — 전송 도중 DMA_FAULT */
+static void test_memcpy_dma_fault_src(void)
+{
+    nacc_start();
+
+    mem_fill_byte(DST_ADDR, 64, DST_POISON);
+
+    g_assert_cmpuint(run_one_memcpy(BAD_ADDR, DST_ADDR, 64, 8),
+                     ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_DMA_FAULT);
+    g_assert_cmphex(ring_status(0), ==, ERR_DMA_FAULT);
+
+    qtest_end();
+}
+
+/* 목적지가 RAM 밖 */
+static void test_memcpy_dma_fault_dst(void)
+{
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, 64, 0x42);
+
+    g_assert_cmpuint(run_one_memcpy(SRC_ADDR, BAD_ADDR, 64, 8),
+                     ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_DMA_FAULT);
+
+    qtest_end();
+}
+
+/*
+ * NOP 과 MEMCPY 를 섞어서 제출한다.
+ * 링이 opcode 에 관계없이 순서대로 돌아가는지.
+ */
+static void test_memcpy_mixed_with_nop(void)
+{
+    const uint32_t len = 64;
+
+    nacc_start();
+
+    mem_fill_pattern(SRC_ADDR, len, 0x77);
+    mem_fill_byte(DST_ADDR, len, DST_POISON);
+
+    ring_put(0, OP_NOP, 0, 0, 0);
+    ring_put(1, OP_MEMCPY, SRC_ADDR, DST_ADDR, len);
+    ring_put(2, OP_NOP, 0, 0, 0);
+
+    nacc_to_ready();
+    nacc_writel(R_RING_PROD, 3);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 3);
+
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    mem_check_pattern(DST_ADDR, len, 0x77);
+
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(1), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(2), ==, ERR_NONE);
 
     qtest_end();
 }
@@ -1177,7 +1520,7 @@ int main(int argc, char **argv)
     qtest_add_func("/nacc/redundant-enable",  test_redundant_enable_ignored);
     qtest_add_func("/nacc/id-stable",         test_id_stable_across_states);
 
-    /* 단계 3 — 커맨드 링 */
+    /* 단계 3 — 커맨드 링 (NOP) */
     qtest_add_func("/nacc/ram-sanity",        test_ram_sanity);
     qtest_add_func("/nacc/ring-nop-single",   test_ring_nop_single);
     qtest_add_func("/nacc/ring-stepwise",     test_ring_nop_stepwise);
@@ -1189,6 +1532,19 @@ int main(int argc, char **argv)
     qtest_add_func("/nacc/t8-abort-busy",     test_t8_abort_during_busy);
     qtest_add_func("/nacc/restart-abort",     test_restart_after_abort);
     qtest_add_func("/nacc/dma-fault",         test_dma_fault_out_of_ram);
+
+    /* 단계 3 — MEMCPY */
+    qtest_add_func("/nacc/memcpy-basic",      test_memcpy_basic);
+    qtest_add_func("/nacc/memcpy-multi-chunk", test_memcpy_multi_chunk);
+    qtest_add_func("/nacc/memcpy-odd-chunk",  test_memcpy_odd_chunk);
+    qtest_add_func("/nacc/memcpy-integrity",  test_memcpy_dest_integrity);
+    qtest_add_func("/nacc/memcpy-bad-length", test_memcpy_bad_length);
+    qtest_add_func("/nacc/memcpy-max-length", test_memcpy_max_length_valid);
+    qtest_add_func("/nacc/memcpy-bad-align",  test_memcpy_bad_align);
+    qtest_add_func("/nacc/memcpy-order",      test_memcpy_length_checked_first);
+    qtest_add_func("/nacc/memcpy-fault-src",  test_memcpy_dma_fault_src);
+    qtest_add_func("/nacc/memcpy-fault-dst",  test_memcpy_dma_fault_dst);
+    qtest_add_func("/nacc/memcpy-mixed",      test_memcpy_mixed_with_nop);
 
     return g_test_run();
 }

@@ -80,6 +80,8 @@ DECLARE_INSTANCE_CHECKER(NaccState, NACC, TYPE_PCI_NACC_DEVICE)
 #define NACC_DESC_OFF_OPCODE    0x00
 #define NACC_DESC_OFF_STATUS    0x1C
 
+#define NACC_MAX_XFER       0x100000u
+#define NACC_XFER_CHUNK     4096
 
 /*
  * §3.3 HALTING 체류 시간.
@@ -411,6 +413,40 @@ static uint64_t nacc_mmio_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
+static bool nacc_do_memcpy(NaccState *s, uint64_t src, uint64_t dst, uint32_t len)
+{
+    uint8_t buf[NACC_XFER_CHUNK];
+
+    while (len) {
+        uint32_t n = MIN(len, sizeof(buf));
+
+        if (pci_dma_read(&s->pdev, src, buf, n) != MEMTX_OK) {
+            return false;
+        }
+        if (pci_dma_write(&s->pdev, dst, buf, n) != MEMTX_OK) {
+            return false;
+        }
+        src += n;
+        dst += n;
+        len -= n;
+    }
+    return true;
+}
+
+/* T7 — 실패한 디스크립터의 status 에 오류 코드를 기록하고 ERROR 로 간다 */
+static void nacc_fail_descriptor(NaccState *s, uint64_t desc_addr,
+                                 uint32_t code)
+{
+    uint32_t st = cpu_to_le32(code);
+
+    /* NACC-REQ-050. 페치 자체가 실패한 경우엔 이 쓰기도 실패할 수 있으나
+     * 추가 오류를 발생시키지 않는다 (§8.2 예외 조항) */
+    pci_dma_write(&s->pdev, desc_addr + NACC_DESC_OFF_STATUS,
+                  &st, sizeof(st));
+
+    nacc_goto_error(s, code);
+}
+
 static bool nacc_exec_descriptor(NaccState *s)
 {
     NaccDesc desc;
@@ -429,12 +465,28 @@ static bool nacc_exec_descriptor(NaccState *s)
     case NACC_OP_NOP:
         break;                      /* 필드 검증 없음 */
 
-    case NACC_OP_MEMCPY:
+    case NACC_OP_MEMCPY: {
         /* TODO: length / 정렬 검증 후 전송 */
-        break;
+        uint64_t src = le64_to_cpu(desc.src_addr);
+        uint64_t dst = le64_to_cpu(desc.dst_addr);
+        uint32_t len = le32_to_cpu(desc.length);
 
+        if (len == 0 || len > NACC_MAX_XFER || (len & 0x3)) {
+            nacc_fail_descriptor(s, addr, NACC_ERR_BAD_LENGTH);
+            return false;
+        }
+        if ((src & 0x3) || (dst & 0x3)) {
+            nacc_fail_descriptor(s, addr, NACC_ERR_BAD_ALIGN);
+            return false;
+        }
+        if (!nacc_do_memcpy(s, src, dst, len)) {
+            nacc_fail_descriptor(s, addr, NACC_ERR_DMA_FAULT);
+            return false;
+        }
+        break;
+    }
     default:
-        nacc_goto_error(s, NACC_ERR_BAD_OPCODE);
+        nacc_fail_descriptor(s, addr, NACC_ERR_BAD_OPCODE);
         return false;
     }
 
