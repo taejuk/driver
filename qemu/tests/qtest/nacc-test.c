@@ -3,8 +3,9 @@
  *
  * 단계 1: PCI 식별, BAR0, 레지스터 파일
  * 단계 2: 상태 머신 (T1/T2/T3/T5/T8/T9/T10) + "전이표에 없는 조합"
+ * 단계 3: 커맨드 링 (T4/T6/T7/T11/T12), NOP, writeback
  *
- * 미검증 (단계 3): T4/T6/T7/T11/T12 — 커맨드 링 처리가 필요하다.
+ * 미검증: MEMCPY 데이터 이동, BAD_LENGTH / BAD_ALIGN
  *
  * 검증 환경 전제:
  *   -machine virt,highmem-ecam=off
@@ -12,6 +13,7 @@
  *       접근할 수 없다 (hw/arm/virt.c: vms->highmem_ecam = true).
  *   -net none
  *       기본 virtio-net 이 슬롯 1 을 차지한다.
+ *   BAR 설정 시 BME(0x04) 필수 — 없으면 pci_dma_read 가 실패한다.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -43,7 +45,7 @@
 
 #define PCI_CMD_MEM_SPACE   0x0002
 #define PCI_CMD_BUS_MASTER  0x0004
-#define NACC_EXEC_DELAY_MS 2
+
 /* §2.1 */
 #define NACC_VENDOR_ID      0x1234
 #define NACC_DEVICE_ID      0x11EA
@@ -86,19 +88,53 @@
 #define ERR_NONE            0x00
 #define ERR_BAD_CONFIG      0x01
 #define ERR_BAD_PROD        0x02
+#define ERR_BAD_OPCODE      0x03
+#define ERR_BAD_LENGTH      0x04
+#define ERR_BAD_ALIGN       0x05
+#define ERR_DMA_FAULT       0x06
+
+/* §6.1 디스크립터 */
+#define DESC_SIZE           32
+#define DESC_OFF_STATUS     0x1C
+
+/* §6.5 opcode */
+#define OP_NOP              0x00
+#define OP_MEMCPY           0x01
 
 /* 유효한 링 설정 — 32바이트 정렬, 2의 거듭제곱 */
 #define RING_ADDR           0x40000000ULL
 #define RING_SZ             8
 
-/* 디바이스 구현의 HALTING 지연 (NACC_HALT_DELAY_MS) 보다 넉넉히 */
+/* MEMCPY 버퍼용 영역. 링과 겹치지 않게 */
+#define SRC_ADDR            (RING_ADDR + 0x10000)
+#define DST_ADDR            (RING_ADDR + 0x20000)
+
+/*
+ * 디바이스 구현의 지연 상수와 맞춰야 한다.
+ * 한쪽만 바꾸면 테스트가 깨진다.
+ *   NACC_HALT_DELAY_MS = 20
+ *   NACC_EXEC_DELAY_MS = 2
+ */
 #define HALT_DELAY_MS       20
+#define EXEC_DELAY_MS       2
 #define MS_IN_NS            1000000LL
+
+/* writeback 이 실제로 일어났는지 보려고 미리 심어두는 값 */
+#define STATUS_POISON       0xA5A5A5A5u
 
 /* §5.1 정의되지 않은 오프셋 (NACC-REQ-021) */
 static const uint32_t undefined_offsets[] = {
     0x0004, 0x0018, 0x001C, 0x0034, 0x0038, 0x003C, 0x0044, 0x0800, 0x0FFC,
 };
+
+typedef struct QEMU_PACKED TestDesc {
+    uint32_t opcode;
+    uint32_t flags;
+    uint64_t src_addr;
+    uint64_t dst_addr;
+    uint32_t length;
+    uint32_t status;
+} TestDesc;
 
 /* ------------------------------------------------------------------
  * 헬퍼
@@ -121,7 +157,8 @@ static uint32_t nacc_state(void)
 
 /*
  * qtest 는 펌웨어를 실행하지 않으므로 BAR 가 미할당 상태다.
- * 테스트가 직접 BAR 를 프로그래밍하고 Memory Space Enable 을 켠다.
+ * 테스트가 직접 BAR 를 프로그래밍하고 MSE / BME 를 켠다.
+ * BME 가 없으면 pci_dma_read 가 실패해 전부 DMA_FAULT 가 난다.
  */
 static void nacc_setup_bar(void)
 {
@@ -129,7 +166,8 @@ static void nacc_setup_bar(void)
 
     writel(NACC_BDF_ECAM + PCI_CFG_BAR0, NACC_BAR0_ADDR);
     cmd = readw(NACC_BDF_ECAM + PCI_CFG_COMMAND);
-    writew(NACC_BDF_ECAM + PCI_CFG_COMMAND, cmd | PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
+    writew(NACC_BDF_ECAM + PCI_CFG_COMMAND,
+           cmd | PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
 }
 
 /* RESET 상태로 시작 */
@@ -161,6 +199,50 @@ static void nacc_to_ready(void)
 static void nacc_clock_step_ms(int64_t ms)
 {
     qtest_clock_step(global_qtest, ms * MS_IN_NS);
+}
+
+/* 디스크립터 하나가 처리될 만큼만 전진 */
+static void step_one_desc(void)
+{
+    nacc_clock_step_ms(EXEC_DELAY_MS + 1);
+}
+
+static uint64_t ring_slot_addr(uint32_t slot)
+{
+    return RING_ADDR + (uint64_t)slot * DESC_SIZE;
+}
+
+/* 한 슬롯에 디스크립터를 쓴다. status 는 포이즌으로 채워 둔다 */
+static void ring_put(uint32_t slot, uint32_t opcode,
+                     uint64_t src, uint64_t dst, uint32_t len)
+{
+    TestDesc d = {
+        .opcode   = cpu_to_le32(opcode),
+        .flags    = 0,                      /* NACC-REQ-032 */
+        .src_addr = cpu_to_le64(src),
+        .dst_addr = cpu_to_le64(dst),
+        .length   = cpu_to_le32(len),
+        .status   = cpu_to_le32(STATUS_POISON),
+    };
+
+    qtest_memwrite(global_qtest, ring_slot_addr(slot), &d, sizeof(d));
+}
+
+static uint32_t ring_status(uint32_t slot)
+{
+    uint32_t st;
+
+    qtest_memread(global_qtest, ring_slot_addr(slot) + DESC_OFF_STATUS,
+                  &st, sizeof(st));
+    return le32_to_cpu(st);
+}
+
+/* 링 전체를 NOP 으로 채운다 */
+static void ring_fill_nop(uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        ring_put(i, OP_NOP, 0, 0, 0);
+    }
 }
 
 /* ==================================================================
@@ -236,7 +318,6 @@ static void test_reset_values(void)
  *
  * CTRL 은 여기서 다루지 않는다. RESET 에서는 §5.2 에 따라 값이 저장되지
  * 않고, ENABLE 비트가 켜진 값을 쓰면 T10 이 발동한다.
- * CTRL 의 예약 비트 보존은 test_ctrl_preserves_reserved 에서 확인한다.
  */
 static void test_rw_registers_preserve_reserved(void)
 {
@@ -270,7 +351,6 @@ static void test_ctrl_preserves_reserved(void)
 
     nacc_writel(R_CTRL, pattern);
     g_assert_cmphex(nacc_readl(R_CTRL), ==, pattern);
-    /* ENABLE=0 이므로 INIT 에서 전이가 없어야 한다 */
     g_assert_cmpuint(nacc_state(), ==, ST_INIT);
 
     qtest_end();
@@ -343,7 +423,7 @@ static void test_t1_latch_on_hi(void)
     nacc_start();
 
     nacc_writel(R_RING_BASE_LO, (uint32_t)RING_ADDR);
-    g_assert_cmpuint(nacc_state(), ==, ST_RESET);       /* 아직 RESET */
+    g_assert_cmpuint(nacc_state(), ==, ST_RESET);
     g_assert_cmphex(nacc_readl(R_RING_BASE_LO), ==, (uint32_t)RING_ADDR);
 
     nacc_writel(R_RING_BASE_HI, (uint32_t)(RING_ADDR >> 32));
@@ -352,7 +432,7 @@ static void test_t1_latch_on_hi(void)
     qtest_end();
 }
 
-/* INIT 에서 RING_BASE_HI 를 다시 써도 전이는 없다 (INIT -> INIT) */
+/* INIT 에서 RING_BASE_HI 를 다시 써도 전이는 없다 */
 static void test_t1_rewrite_in_init(void)
 {
     nacc_start();
@@ -376,7 +456,6 @@ static void test_t2_enable_valid(void)
     nacc_writel(R_CTRL, CTRL_ENABLE);
 
     g_assert_cmpuint(nacc_state(), ==, ST_READY);
-    /* T2 부수효과: cons, prod, err_code 초기화 */
     g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);
     g_assert_cmphex(nacc_readl(R_RING_PROD), ==, 0);
     g_assert_cmphex(nacc_readl(R_ERR_CODE),  ==, ERR_NONE);
@@ -426,7 +505,7 @@ static void test_t3_unaligned_base(void)
 {
     nacc_start();
 
-    nacc_writel(R_RING_BASE_LO, (uint32_t)RING_ADDR | 0x10);  /* 하위 5비트 */
+    nacc_writel(R_RING_BASE_LO, (uint32_t)RING_ADDR | 0x10);
     nacc_writel(R_RING_BASE_HI, 0);
     g_assert_cmpuint(nacc_state(), ==, ST_INIT);
 
@@ -447,7 +526,6 @@ static void test_t3_zero_base(void)
 {
     nacc_start();
 
-    /* LO=0, HI=0 을 써서 래치. 주소가 0 이므로 무효 */
     nacc_writel(R_RING_BASE_LO, 0);
     nacc_writel(R_RING_BASE_HI, 0);
     g_assert_cmpuint(nacc_state(), ==, ST_INIT);        /* T1 은 일어난다 */
@@ -465,15 +543,13 @@ static void test_t3_zero_base(void)
  * NACC-REQ-098 — 유효성 판정은 래치된 값을 본다.
  *
  * LO 에 미정렬 주소를 쓰되 HI 를 쓰지 않으면 래치는 갱신되지 않는다.
- * 따라서 이전에 래치된 (정렬된) 주소로 판정되어 T2 가 일어나야 한다.
  * 섀도를 보는 구현이면 여기서 ERROR 가 나므로 걸린다.
  */
 static void test_validation_uses_latched_base(void)
 {
     nacc_start();
-    nacc_to_init();                      /* 정렬된 주소가 래치됨 */
+    nacc_to_init();
 
-    /* 섀도만 미정렬로 오염시킨다 */
     nacc_writel(R_RING_BASE_LO, (uint32_t)RING_ADDR | 0x1F);
 
     nacc_writel(R_RING_SIZE, RING_SZ);
@@ -512,12 +588,11 @@ static void test_t8_t9_halting(void)
     nacc_writel(R_CTRL, 0);                              /* T8 */
     g_assert_cmpuint(nacc_state(), ==, ST_HALTING);
 
-    /* 지연이 실제로 걸려 있는지 — 절반만 전진시키면 아직 HALTING */
+    /* 절반만 전진시키면 아직 HALTING */
     nacc_clock_step_ms(HALT_DELAY_MS / 2);
     g_assert_cmpuint(nacc_state(), ==, ST_HALTING);
 
-    /* 지연을 넘기면 INIT (T9) */
-    nacc_clock_step_ms(HALT_DELAY_MS);
+    nacc_clock_step_ms(HALT_DELAY_MS);                   /* T9 */
     g_assert_cmpuint(nacc_state(), ==, ST_INIT);
 
     /* §3.2 T9: 링 설정값은 보존된다 */
@@ -547,39 +622,30 @@ static void test_halting_ignores_enable(void)
 
 /*
  * §8.2 NACC-REQ-051 — 오류 복구 전체 경로.
- * ERROR -> (ENABLE<-0) HALTING -> INIT -> (ENABLE<-1) READY
- *
  * NACC-REQ-093: ERR_CODE 는 T2 가 일어날 때까지 보존된다.
  */
 static void test_error_recovery_path(void)
 {
     nacc_start();
 
-    /* T10 으로 ERROR 진입 */
-    nacc_writel(R_CTRL, CTRL_ENABLE);
+    nacc_writel(R_CTRL, CTRL_ENABLE);                    /* T10 */
     g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_CONFIG);
 
-    /* T8 */
-    nacc_writel(R_CTRL, 0);
+    nacc_writel(R_CTRL, 0);                              /* T8 */
     g_assert_cmpuint(nacc_state(), ==, ST_HALTING);
-    /* HALTING 중에도 ERR_CODE 보존 */
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_CONFIG);
 
-    /* T9 */
-    nacc_clock_step_ms(HALT_DELAY_MS + 1);
+    nacc_clock_step_ms(HALT_DELAY_MS + 1);               /* T9 */
     g_assert_cmpuint(nacc_state(), ==, ST_INIT);
-    /* INIT 에서도 아직 보존 */
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_CONFIG);
 
-    /* 링을 설정하고 재활성화 */
     nacc_writel(R_RING_BASE_LO, (uint32_t)RING_ADDR);
     nacc_writel(R_RING_BASE_HI, (uint32_t)(RING_ADDR >> 32));
     nacc_writel(R_RING_SIZE, RING_SZ);
     nacc_writel(R_CTRL, CTRL_ENABLE);                    /* T2 */
 
     g_assert_cmpuint(nacc_state(), ==, ST_READY);
-    /* T2 에서 비로소 클리어 */
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_NONE);
 
     qtest_end();
@@ -598,30 +664,27 @@ static void test_t5_bad_prod(void)
 
     g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
     g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_PROD);
-    /* §3.2 T5: RING_CONS 불변 */
     g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);
 
     qtest_end();
 }
 
-/* RING_SZ-1 은 유효하므로 ERROR 가 아니어야 한다 */
+/* RING_SZ-1 은 유효하다. T4 가 일어나 BUSY 가 된다 */
 static void test_prod_max_valid(void)
 {
     nacc_start();
+    ring_fill_nop(RING_SZ);
     nacc_to_ready();
 
     nacc_writel(R_RING_PROD, RING_SZ - 1);
 
-    g_assert_cmpuint(nacc_state(), !=, ST_ERROR);
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
     g_assert_cmphex(nacc_readl(R_RING_PROD), ==, RING_SZ - 1);
 
     qtest_end();
 }
 
-/*
- * §5.2 접근 가능 행렬 — READY 에서 링 설정 레지스터는 R.
- * 쓰기는 무시되고 값이 바뀌지 않아야 한다.
- */
+/* §5.2 — READY 에서 링 설정 레지스터는 R */
 static void test_ring_config_locked_in_ready(void)
 {
     nacc_start();
@@ -642,10 +705,7 @@ static void test_ring_config_locked_in_ready(void)
     qtest_end();
 }
 
-/*
- * §3.2 "전이표에 없는 조합" — RESET / INIT 에서 doorbell 은 무시된다.
- * 쓰기 무시이므로 RING_PROD 값도 바뀌지 않는다.
- */
+/* §3.2 "전이표에 없는 조합" — RESET / INIT 에서 doorbell 은 무시된다 */
 static void test_doorbell_ignored_before_ready(void)
 {
     nacc_start();
@@ -680,21 +740,28 @@ static void test_disable_ignored_when_inactive(void)
     qtest_end();
 }
 
-/* 이미 READY 인데 ENABLE<-1 을 또 써도 무시된다 */
-// static void test_redundant_enable_ignored(void)
-// {
-//     nacc_start();
-//     nacc_to_ready();
+/*
+ * 이미 활성인 상태에서 ENABLE<-1 을 또 써도 무시된다.
+ *
+ * 단계 3 에서 doorbell 이 T4 를 유발하게 되었으므로 BUSY 에서 확인한다.
+ * T2 가 다시 일어났다면 prod/cons 가 0 으로 밀리고 READY 가 되었을 것이다.
+ */
+static void test_redundant_enable_ignored(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
 
-//     nacc_writel(R_RING_PROD, 3);
-//     nacc_writel(R_CTRL, CTRL_ENABLE);
+    nacc_writel(R_RING_PROD, 3);                         /* T4 -> BUSY */
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
 
-//     g_assert_cmpuint(nacc_state(), ==, ST_READY);
-//     /* T2 가 다시 일어났다면 prod 가 0 으로 밀렸을 것이다 */
-//     g_assert_cmphex(nacc_readl(R_RING_PROD), ==, 3);
+    nacc_writel(R_CTRL, CTRL_ENABLE);                    /* 무시되어야 함 */
 
-//     qtest_end();
-// }
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+    g_assert_cmphex(nacc_readl(R_RING_PROD), ==, 3);
+
+    qtest_end();
+}
 
 /* NACC-REQ-023 — ID 는 모든 상태에서 같은 값 */
 static void test_id_stable_across_states(void)
@@ -715,22 +782,358 @@ static void test_id_stable_across_states(void)
     qtest_end();
 }
 
-static void test_nop_single(void)
-{
-    uint8_t desc[32] = { 0 };       /* opcode = NOP(0) */
+/* ==================================================================
+ * 단계 3 — 커맨드 링
+ * ================================================================== */
 
+/*
+ * RING_ADDR 이 실제 RAM 인지 먼저 확인한다.
+ * 여기가 실패하면 이후 링 테스트가 전부 DMA_FAULT 로 무너진다.
+ * 원인 찾느라 헤매지 않도록 별도 테스트로 둔다.
+ */
+static void test_ram_sanity(void)
+{
+    qtest_start(NACC_QEMU_ARGS);
+
+    qtest_writel(global_qtest, RING_ADDR, 0xDEADBEEF);
+    g_assert_cmphex(qtest_readl(global_qtest, RING_ADDR), ==, 0xDEADBEEF);
+
+    qtest_writel(global_qtest, SRC_ADDR, 0xCAFEBABE);
+    g_assert_cmphex(qtest_readl(global_qtest, SRC_ADDR), ==, 0xCAFEBABE);
+
+    qtest_writel(global_qtest, DST_ADDR, 0x12345678);
+    g_assert_cmphex(qtest_readl(global_qtest, DST_ADDR), ==, 0x12345678);
+
+    qtest_end();
+}
+
+/*
+ * T4 -> T6 왕복. 디스크립터 하나.
+ *
+ * ST_BUSY 단언이 핵심이다. 디바이스가 doorbell 핸들러 안에서
+ * 즉시 처리해 버리면 여기서 걸린다.
+ */
+static void test_ring_nop_single(void)
+{
     nacc_start();
-    qtest_memwrite(global_qtest, RING_ADDR, desc, sizeof(desc));
+    ring_fill_nop(RING_SZ);
     nacc_to_ready();
 
-    nacc_writel(R_RING_PROD, 1);                  /* T4 */
-    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);  /* 즉시 완료되면 실패 */
+    nacc_writel(R_RING_PROD, 1);                        /* T4 */
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);    /* 아직 처리 전 */
 
-    nacc_clock_step_ms(NACC_EXEC_DELAY_MS + 1);
+    step_one_desc();
 
-    g_assert_cmpuint(nacc_state(), ==, ST_READY); /* T6 */
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);       /* T6 */
     g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
     g_assert_cmphex(nacc_readl(R_IRQ_STATUS), ==, IRQ_CMD_DONE);
+    /* NACC-REQ-033: status writeback */
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+
+    qtest_end();
+}
+
+/*
+ * 여러 개를 제출하고 한 칸씩 처리되는지 본다.
+ * 완료 인터럽트는 마지막에 한 번만 나야 한다 (§3.2 T6).
+ */
+static void test_ring_nop_stepwise(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 3);
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+    /* 디스크립터마다 인터럽트가 나면 안 된다 */
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS), ==, 0);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS), ==, 0);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 3);
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);       /* T6 */
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS), ==, IRQ_CMD_DONE);
+
+    /* 처리한 슬롯만 writeback */
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(1), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(2), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(3), ==, STATUS_POISON); /* 미처리 */
+
+    qtest_end();
+}
+
+/*
+ * wrap-around. 인덱스 마스크 연산이 맞는지 확인한다.
+ * RING_SZ=8 에서 cons 6 -> 7 -> 0 -> 1 -> 2 로 0 을 통과한다.
+ */
+static void test_ring_wraparound(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    /* 1라운드: 슬롯 0..5 */
+    nacc_writel(R_RING_PROD, 6);
+    for (int i = 0; i < 6; i++) {
+        step_one_desc();
+    }
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 6);
+
+    /* 슬롯을 다시 채우고 2라운드 */
+    ring_fill_nop(RING_SZ);
+    nacc_writel(R_IRQ_STATUS, IRQ_CMD_DONE);            /* ack */
+
+    nacc_writel(R_RING_PROD, 2);                        /* T4 */
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 7);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);    /* 여기서 순환 */
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+
+    g_assert_cmphex(ring_status(7), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(1), ==, ERR_NONE);
+
+    qtest_end();
+}
+
+/*
+ * NACC-REQ-045 — NOP 은 src/dst/length 를 검증하지 않는다.
+ * 검증 루틴을 opcode 판별 앞에 두면 여기서 걸린다 (NACC-REQ-055).
+ */
+static void test_nop_ignores_fields(void)
+{
+    nacc_start();
+
+    /* 정렬도 안 맞고 길이도 범위 밖인 쓰레기 값 */
+    ring_put(0, OP_NOP, 0x1, 0x3, 0xFFFFFFFF);
+
+    nacc_to_ready();
+    nacc_writel(R_RING_PROD, 1);
+    step_one_desc();
+
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_NONE);
+    g_assert_cmphex(ring_status(0), ==, ERR_NONE);
+
+    qtest_end();
+}
+
+/*
+ * T11 — BUSY 중에 prod 를 늘리면 이어서 처리된다.
+ * 매 콜백이 새 prod 를 보므로 별도 처리 없이 성립한다.
+ */
+static void test_t11_append_during_busy(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 2);
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    nacc_writel(R_RING_PROD, 5);                        /* T11 */
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    for (int i = 0; i < 4; i++) {
+        step_one_desc();
+    }
+
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 5);
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    g_assert_cmphex(ring_status(4), ==, ERR_NONE);
+
+    qtest_end();
+}
+
+/* T12 — BUSY 중에 범위 밖 prod */
+static void test_t12_bad_prod_during_busy(void)
+{
+    uint32_t cons;
+
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 4);
+    step_one_desc();
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    nacc_writel(R_RING_PROD, RING_SZ);                  /* 무효 */
+
+    g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_PROD);
+
+    /* ERROR 진입 후에는 처리가 멈춰야 한다 */
+    cons = nacc_readl(R_RING_CONS);
+    step_one_desc();
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, cons);
+
+    qtest_end();
+}
+
+/*
+ * T7 — 정의되지 않은 opcode.
+ * NACC-REQ-078: RING_CONS 가 실패한 디스크립터를 가리킨 채 고정된다.
+ */
+static void test_t7_bad_opcode(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    ring_put(2, 0x99, 0, 0, 0);                         /* 슬롯 2 만 불량 */
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 5);
+
+    step_one_desc();                                    /* 슬롯 0 */
+    step_one_desc();                                    /* 슬롯 1 */
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    step_one_desc();                                    /* 슬롯 2 -> T7 */
+    g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_BAD_OPCODE);
+    /* 실패한 슬롯을 가리킨 채 고정 — 다음 슬롯이 아니다 */
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS) & IRQ_CMD_ERR, ==, IRQ_CMD_ERR);
+
+    /* 이후 슬롯은 건드리지 않는다 */
+    g_assert_cmphex(ring_status(3), ==, STATUS_POISON);
+    g_assert_cmphex(ring_status(4), ==, STATUS_POISON);
+
+    /* 더 이상 진행하지 않는다 */
+    step_one_desc();
+    step_one_desc();
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 2);
+
+    qtest_end();
+}
+
+/*
+ * T8 during BUSY — 진행 중 명령 폐기.
+ *
+ * NACC-REQ-090: HALTING 진입 후 새 메모리 요청을 발행하지 않는다.
+ *               exec_timer 를 끄지 않으면 cons 가 계속 오른다.
+ * NACC-REQ-094: 폐기된 명령에 완료 인터럽트가 없다.
+ * NACC-REQ-095: HALTING 진입 시점의 cons 가 폐기 경계다.
+ */
+static void test_t8_abort_during_busy(void)
+{
+    uint32_t boundary;
+
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 6);
+    step_one_desc();
+    step_one_desc();
+    g_assert_cmpuint(nacc_state(), ==, ST_BUSY);
+
+    boundary = nacc_readl(R_RING_CONS);
+    g_assert_cmphex(boundary, ==, 2);
+
+    nacc_writel(R_CTRL, 0);                             /* T8 */
+    g_assert_cmpuint(nacc_state(), ==, ST_HALTING);
+
+    /* HALTING 동안 처리가 이어지면 안 된다 */
+    nacc_clock_step_ms(EXEC_DELAY_MS * 4);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, boundary);
+    g_assert_cmpuint(nacc_state(), ==, ST_HALTING);
+
+    nacc_clock_step_ms(HALT_DELAY_MS + 1);              /* T9 */
+    g_assert_cmpuint(nacc_state(), ==, ST_INIT);
+
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, boundary);
+    /* 폐기된 명령에 완료 인터럽트가 없다 */
+    g_assert_cmphex(nacc_readl(R_IRQ_STATUS) & IRQ_CMD_DONE, ==, 0);
+    /* 폐기된 슬롯은 writeback 되지 않았다 */
+    g_assert_cmphex(ring_status(boundary), ==, STATUS_POISON);
+
+    /* T9 이후에도 진행되지 않는다 */
+    nacc_clock_step_ms(EXEC_DELAY_MS * 4);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, boundary);
+
+    qtest_end();
+}
+
+/* 폐기 후 재활성화. T2 가 cons/prod 를 0 으로 되돌린다 (NACC-REQ-076) */
+static void test_restart_after_abort(void)
+{
+    nacc_start();
+    ring_fill_nop(RING_SZ);
+    nacc_to_ready();
+
+    nacc_writel(R_RING_PROD, 6);
+    step_one_desc();
+    nacc_writel(R_CTRL, 0);
+    nacc_clock_step_ms(HALT_DELAY_MS + 1);
+    g_assert_cmpuint(nacc_state(), ==, ST_INIT);
+
+    nacc_writel(R_CTRL, CTRL_ENABLE);                   /* T2 */
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 0);
+    g_assert_cmphex(nacc_readl(R_RING_PROD), ==, 0);
+
+    /* 다시 정상 동작하는지 */
+    ring_fill_nop(RING_SZ);
+    nacc_writel(R_RING_PROD, 1);
+    step_one_desc();
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);
+    g_assert_cmphex(nacc_readl(R_RING_CONS), ==, 1);
+
+    qtest_end();
+}
+
+/*
+ * DMA_FAULT — 링 베이스를 RAM 밖으로 잡는다.
+ *
+ * §3.5 유효성 판정은 정렬과 0 여부만 보므로 READY 까지는 간다.
+ * doorbell 을 치는 순간 페치가 실패해야 한다 (§6.6 1번).
+ *
+ * 주의: QEMU 가 MEMTX_OK 를 반환하고 0 을 읽어오면 opcode 가 0(NOP) 으로
+ * 해석되어 성공해 버린다. 그 경우 이 테스트는 실패하며, 별도 주입 장치가
+ * 필요하다는 뜻이다. qemu/README.md 에 기록할 것.
+ */
+static void test_dma_fault_out_of_ram(void)
+{
+    const uint64_t bad_base = 0xFFFF000000000000ULL;    /* 32B 정렬, 0 아님 */
+
+    nacc_start();
+
+    nacc_writel(R_RING_BASE_LO, (uint32_t)bad_base);
+    nacc_writel(R_RING_BASE_HI, (uint32_t)(bad_base >> 32));
+    nacc_writel(R_RING_SIZE, RING_SZ);
+    nacc_writel(R_CTRL, CTRL_ENABLE);
+    g_assert_cmpuint(nacc_state(), ==, ST_READY);       /* 주소는 검증 못 함 */
+
+    nacc_writel(R_RING_PROD, 1);
+    step_one_desc();
+
+    g_assert_cmpuint(nacc_state(), ==, ST_ERROR);
+    g_assert_cmphex(nacc_readl(R_ERR_CODE), ==, ERR_DMA_FAULT);
 
     qtest_end();
 }
@@ -741,40 +1144,51 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
-    /* 단계 1 */
-    qtest_add_func("/nacc/pci-identity",     test_pci_identity);
-    qtest_add_func("/nacc/bar0-size",        test_bar0_size);
-    qtest_add_func("/nacc/id-register",      test_id_register);
-    qtest_add_func("/nacc/reset-values",     test_reset_values);
-    qtest_add_func("/nacc/rw-reserved",      test_rw_registers_preserve_reserved);
-    qtest_add_func("/nacc/ctrl-reserved",    test_ctrl_preserves_reserved);
-    qtest_add_func("/nacc/ro-ignore",        test_ro_registers_ignore_writes);
-    qtest_add_func("/nacc/undefined",        test_undefined_offsets);
-    qtest_add_func("/nacc/irq-status-rw1c",  test_irq_status_rw1c_shape);
+    /* 단계 1 — PCI / 레지스터 파일 */
+    qtest_add_func("/nacc/pci-identity",      test_pci_identity);
+    qtest_add_func("/nacc/bar0-size",         test_bar0_size);
+    qtest_add_func("/nacc/id-register",       test_id_register);
+    qtest_add_func("/nacc/reset-values",      test_reset_values);
+    qtest_add_func("/nacc/rw-reserved",       test_rw_registers_preserve_reserved);
+    qtest_add_func("/nacc/ctrl-reserved",     test_ctrl_preserves_reserved);
+    qtest_add_func("/nacc/ro-ignore",         test_ro_registers_ignore_writes);
+    qtest_add_func("/nacc/undefined",         test_undefined_offsets);
+    qtest_add_func("/nacc/irq-status-rw1c",   test_irq_status_rw1c_shape);
 
     /* 단계 2 — 전이 */
-    qtest_add_func("/nacc/t1-latch-on-hi",   test_t1_latch_on_hi);
-    qtest_add_func("/nacc/t1-rewrite-init",  test_t1_rewrite_in_init);
-    qtest_add_func("/nacc/t2-enable-valid",  test_t2_enable_valid);
-    qtest_add_func("/nacc/ring-size-bounds", test_ring_size_boundaries);
-    qtest_add_func("/nacc/t3-unaligned",     test_t3_unaligned_base);
-    qtest_add_func("/nacc/t3-zero-base",     test_t3_zero_base);
-    qtest_add_func("/nacc/latched-base",     test_validation_uses_latched_base);
-    qtest_add_func("/nacc/t10-enable-reset", test_t10_enable_in_reset);
-    qtest_add_func("/nacc/t8-t9-halting",    test_t8_t9_halting);
-    qtest_add_func("/nacc/halting-ignores",  test_halting_ignores_enable);
-    qtest_add_func("/nacc/error-recovery",   test_error_recovery_path);
-    qtest_add_func("/nacc/t5-bad-prod",      test_t5_bad_prod);
-    qtest_add_func("/nacc/prod-max-valid",   test_prod_max_valid);
+    qtest_add_func("/nacc/t1-latch-on-hi",    test_t1_latch_on_hi);
+    qtest_add_func("/nacc/t1-rewrite-init",   test_t1_rewrite_in_init);
+    qtest_add_func("/nacc/t2-enable-valid",   test_t2_enable_valid);
+    qtest_add_func("/nacc/ring-size-bounds",  test_ring_size_boundaries);
+    qtest_add_func("/nacc/t3-unaligned",      test_t3_unaligned_base);
+    qtest_add_func("/nacc/t3-zero-base",      test_t3_zero_base);
+    qtest_add_func("/nacc/latched-base",      test_validation_uses_latched_base);
+    qtest_add_func("/nacc/t10-enable-reset",  test_t10_enable_in_reset);
+    qtest_add_func("/nacc/t8-t9-halting",     test_t8_t9_halting);
+    qtest_add_func("/nacc/halting-ignores",   test_halting_ignores_enable);
+    qtest_add_func("/nacc/error-recovery",    test_error_recovery_path);
+    qtest_add_func("/nacc/t5-bad-prod",       test_t5_bad_prod);
+    qtest_add_func("/nacc/prod-max-valid",    test_prod_max_valid);
 
     /* 단계 2 — 접근 제한 및 무시 조합 */
     qtest_add_func("/nacc/ring-locked-ready", test_ring_config_locked_in_ready);
-    qtest_add_func("/nacc/doorbell-ignored", test_doorbell_ignored_before_ready);
-    qtest_add_func("/nacc/disable-ignored",  test_disable_ignored_when_inactive);
-    //qtest_add_func("/nacc/redundant-enable", test_redundant_enable_ignored);
-    qtest_add_func("/nacc/id-stable",        test_id_stable_across_states);
+    qtest_add_func("/nacc/doorbell-ignored",  test_doorbell_ignored_before_ready);
+    qtest_add_func("/nacc/disable-ignored",   test_disable_ignored_when_inactive);
+    qtest_add_func("/nacc/redundant-enable",  test_redundant_enable_ignored);
+    qtest_add_func("/nacc/id-stable",         test_id_stable_across_states);
 
-    /*descriptor*/
-    qtest_add_func("/nacc/descriptor-nop-single", test_nop_single);
+    /* 단계 3 — 커맨드 링 */
+    qtest_add_func("/nacc/ram-sanity",        test_ram_sanity);
+    qtest_add_func("/nacc/ring-nop-single",   test_ring_nop_single);
+    qtest_add_func("/nacc/ring-stepwise",     test_ring_nop_stepwise);
+    qtest_add_func("/nacc/ring-wraparound",   test_ring_wraparound);
+    qtest_add_func("/nacc/nop-ignores",       test_nop_ignores_fields);
+    qtest_add_func("/nacc/t11-append",        test_t11_append_during_busy);
+    qtest_add_func("/nacc/t12-bad-prod",      test_t12_bad_prod_during_busy);
+    qtest_add_func("/nacc/t7-bad-opcode",     test_t7_bad_opcode);
+    qtest_add_func("/nacc/t8-abort-busy",     test_t8_abort_during_busy);
+    qtest_add_func("/nacc/restart-abort",     test_restart_after_abort);
+    qtest_add_func("/nacc/dma-fault",         test_dma_fault_out_of_ram);
+
     return g_test_run();
 }
